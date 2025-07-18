@@ -1,61 +1,97 @@
 %% first_level_analysis.m
 % Basic first-level analysis pipeline for Yagnur neural data
-baseFolder = 'D:\Emiliano\test';
+% This script performs multiple analyses to characterize neural activity patterns:
+% 1) Correlation vs. Distance: tests if neurons that are closer in space have more similar activity
+% 2) Hopkins Statistic: quantifies clusterability of activity in high-dimensional space
+% 3) Elbow Method: estimates optimal cluster number for k-means
+% 4) k-means Clustering: groups neurons by activity patterns
+% 5) PCA Sorting: assesses spatial organization along principal functional axes
+% 6) Cross-Correlation Classification: examines temporal coordination between neuron subsets
+% 7) Frequency Analysis: identifies dominant oscillatory components in activity
+
+baseFolder = 'C:\Users\emiliajm\OneDrive - NTNU\Documents\test';
 defaultFPS = 1.5;
 [fishPaths, fpss] = discover_folders_ini(baseFolder, defaultFPS);
 fprintf('Found %d experiments.\n',numel(fishPaths));
 
 % --- Section 1: Load data and compute ΔF/F ---
+% Rationale: Converting raw fluorescence to ΔF/F normalizes signals and removes baseline drift,
+% ensuring comparisons across neurons and sessions are meaningful.
 % Load tracing and position data
 for f=1:numel(fishPaths)
     S              = load(fullfile(fishPaths{f}, 'results.mat'));  % contains .trace (raw fluorescence) and .position (XYZ)
     rawTraces     = double(S.trace);                              % matrix: neurons × time frames
-    neuronPositions = S.position;                                 % matrix: neurons × 3 (X, Y, Z)
-    
+    positionsOrig = S.position;                                 % matrix: neurons × 3 (X, Y, Z)
+    [DeconvMat,FiltMat]=CaDeconvNew(rawTraces,3,30,0,100,0,200,1/31,0.1,0);
     % Baseline parameters for fluorescence
     tauFast       = 1;      % fast time constant (seconds)
     tauSlow       = 19.4;   % slow time constant adjusted for 30.9 Hz window
     % Compute baseline fluorescence with adjustable time constants
-    baselineFluorescence = baseline_time_adjustable(tauFast, tauSlow, rawTraces, fpss(f));
+    baselineFluorescence = baseline_time_adjustable(tauFast, tauSlow, FiltMat, fpss(f));
     
     % Calculate ΔF/F (%)
-    dffMovWindow = ((rawTraces - baselineFluorescence) ./ baselineFluorescence) * 100;
+    dffMovWindow = ((FiltMat - baselineFluorescence) ./ baselineFluorescence) * 100;
     
     % Remove neurons with NaNs or all-zero traces
     validRowIndices = find(all(~isnan(dffMovWindow), 2));
     filteredDff      = dffMovWindow(validRowIndices, :);
     dffMovWindow         = filteredDff(any(filteredDff, 2), :);  % final ΔF/F matrix
+    positionsOrig = positionsOrig(validRowIndices, :);
+
+    % Remove flyback plane
+    temp = (unique(positionsOrig(:,5)));
+    temp = max([temp]);
+    idx_nonflyback = find(positionsOrig(:,5)~=temp);
+    positionsOrig = positionsOrig(idx_nonflyback,:);
+    dffMovWindow  = dffMovWindow(idx_nonflyback,:);
+    % Define analysis window (frames)
+    % make this 10 mins independent of the fps
+    startFrame = 1;  % insert initial frame, usually skip the first 100 frames
+    endFrame   = startFrame + round(20*60*fpss(f)) - 1;
 end
-% Define analysis window (frames)
-startFrame = 20%% INSERT start frame index
-endFrame   = 2000%% INSERT end frame index
 
 
-%% Section 2: Correlation vs Distance (real vs shuffled)
+
+%% Section 2: Correlation vs Distance (real vs shuffled) 150 microns
+% Rationale: Spatial correlation analysis tests whether proximal neurons share more similar activity.
+% By comparing real vs shuffled positions, we control for global correlations unrelated to space.
 nFiles               = numel(fishPaths);
-steps = floor(linspace(0,100,51));
-nBins = length(steps) - 1;
-allCorrDistReal     = [];
-allCorrDistShuffled = [];
+steps                = floor(linspace(0,200,51));
+nBins                = length(steps) - 1;
+subsampleSize        = size(dffMovWindow,1);                % or round(0.15 * nNeurons)
+allCorrDistReal      = zeros(2*nFiles, nBins);
+allCorrDistShuffled  = zeros(2*nFiles, nBins);
 
 for iFile = 1:nFiles
-
-    positionsOrig    = S.position;     % neuron XYZ positions
+    dffFull           = dffMovWindow;
+    posFull           = positionsOrig;
     
-    % --- Real correlation vs distance ---
-    [~, corrDistReal, ~, ~] = corr_vs_distance_AO(dffMovWindow(:,startFrame:endFrame), positionsOrig, 1, 1, steps);
-    allCorrDistReal = [allCorrDistReal;corrDistReal];
- 
-    % --- Shuffled control: shuffle positions and timepoints ---
-    posShuffled       = positionsOrig(randperm(size(positionsOrig,1)), :);
-    dffShuffled       = dffMovWindow(:, randperm(size(dffMovWindow,2)));
-    [~, corrDistShuff, ~, ~] = corr_vs_distance_AO(dffMovWindow(:,200:1700), posShuffled, 1, 1, steps);
-    allCorrDistShuffled = [allCorrDistShuffled;corrDistReal];
-    
+    % --- pick a random subsample of neurons ---
+    nNeurons          = size(dffFull,1);
+    idxSample         = randperm(nNeurons, min(subsampleSize,nNeurons));
+    dff               = dffFull(idxSample, startFrame:endFrame);
+    pos               = posFull(idxSample, :);
+    tic()
+    % --- Real spatial correlation (2×nBins) ---
+    [~, corrReal, ~, ~] = corr_vs_distance_AO( ...
+        dff, pos, 1, 1, [], steps);
+    allCorrDistReal(2*iFile-1 : 2*iFile, :) = corrReal;
+    toc()
+    tic()
+    % --- Shuffled spatial correlation (2×nBins) ---
+    posShuff      = pos(randperm(numel(idxSample)), :);
+    dffShuff      = dff(:, randperm(size(dff,2)));
+    [~, corrShuff, ~, ~] = corr_vs_distance_AO( ...
+        dff, posShuff, 1, 1, [], steps);
+    allCorrDistShuffled(2*iFile-1 : 2*iFile, :) = corrShuff;
+    toc()
 end
 
+figure;plot(mean(allCorrDistReal(:,:)))
+hold on;plot(mean(allCorrDistShuffled(:,:)))
 
 %% Section 3: Hopkins statistic for real vs. uniform data
+% Rationale: Hopkins statistic H > 0.5 indicates cluster tendency; H ≈ 0.5 is random.
 hopkinsReal    = [];
 hopkinsUniform = [];
 for iFile = 1:nFiles
@@ -68,12 +104,14 @@ for iFile = 1:nFiles
     uniformDff = minVal + (maxVal - minVal) * rand(size(dffMovWindow));
     hopkinsUniform(iFile) = hopkins(uniformDff, m);
 end
-
+display(hopkinsReal)
+display(hopkinsUniform)
 
 %% Section 4: Elbow method to estimate cluster count
+% Rationale: Identify the k where adding clusters yields diminishing returns in within-cluster variance.
 % Evaluate clustering up to 15 clusters on the clean ΔF/F data
 dataWindow = dffMovWindow(:, startFrame:endFrame);
-[maxClusters] = 15;  % maximum clusters to test
+[maxClusters] = 25;  % maximum clusters to test
 [sumDistAll, randSumDistAll, shuffCompSumDist] = evalclust_EY(dataWindow, maxClusters);
 
 figure;
@@ -102,8 +140,9 @@ title('Δ slope vs random');
 
 
 %% Section 5: k-means clustering and visualization
+% Rationale: Partition neurons into k functional groups to reveal common response patterns.
 % Define maximum clusters for analysis (user-defined)
-maxClusters = 5%% INSERT number of clusters;
+maxClusters = 12%% INSERT number of clusters;
 
 for fIdx = 1:numel(fishPaths)
     sliceData = double(dffMovWindow(:, startFrame:endFrame));
@@ -142,10 +181,36 @@ for fIdx = 1:numel(fishPaths)
         if k<maxClusters, set(gca, 'XTickLabel', []); end
         if k==maxClusters, xlabel('Frames'); end
     end
+
+    figure;
+    t = tiledlayout(ceil(sqrt(maxClusters)), ...
+                   ceil(sqrt(maxClusters)), ...
+                   'TileSpacing','compact','Padding','compact');
+    sgtitle(sprintf('Fish %d: individual cluster views', fIdx));
+    
+    for k = 1:maxClusters
+        nexttile;
+        % Plot *all* neurons in light gray
+        scatter3(pos(:,1), pos(:,2), pos(:,3), ...
+                 20, 'MarkerEdgeColor',[.6 .6 .6], ...
+                 'MarkerFaceColor',[.6 .6 .6], ...
+                 'MarkerFaceAlpha',0.05);
+        hold on;
+        % Highlight the k-th cluster in its color
+        idx_k = (clusterIdx == k);
+        scatter3(pos(idx_k,1), pos(idx_k,2), pos(idx_k,3), ...
+                 40, cmap(k,:), 'filled', ...
+                 'MarkerFaceAlpha',0.8, ...
+                 'MarkerEdgeColor','k');
+        view(-90,90);
+        axis tight off;
+        title(sprintf('Cluster %d (%d cells)', k, sum(idx_k)));
+    end
 end
 
 
 %% Section 6: Principal Component (PC) sorting
+% Rationale: Tests if functional ordering (PC angle) aligns with anatomical A-P or L-R axes more than by chance.
 nNeurons = size(dffMovWindow,1);
 realCorrAP = zeros(numel(fishPaths),1);
 realCorrLR = zeros(numel(fishPaths),1);
@@ -188,17 +253,30 @@ title('A-P vs L-R');
 
 
 %% Section 7: Cross-correlation classifier
+% Rationale: Examines temporal coordination between early vs late firing neurons via cross-correlation peaks.
 % Compute cross-correlation between first/last subsets of neurons
 for f = 1:numel(fishPaths)
     fiveMinFrames = 300 * fpss(f);
     numLags      = floor(fiveMinFrames/4);
     windowWidth  = floor(fiveMinFrames/8);
     periodRange  = (numLags+1-windowWidth) : (numLags+1+windowWidth);
-    
-    crossResults = crosscorss_classifier3(dffMovWindow(1:20,startFrame:endFrame), dffMovWindow(21:30,startFrame:endFrame), numLags, periodRange, 1);
+
+    nCells = size(dffMovWindow, 1);
+    firstN  = round(nCells * 0.10); % First 10%
+    lastN   = round(nCells * 0.10); % Last 10%
+
+    % Indices for first and last 10%
+    idxFirst = 1:firstN;
+    idxLast  = (nCells-lastN+1):nCells;
+
+    crossResults = crosscorss_classifier3(dffMovWindow(idxFirst, startFrame:endFrame), ...
+                                          dffMovWindow(idxLast,  startFrame:endFrame), ...
+                                          numLags, periodRange, 1);
 end
 
+
 %% Section 8: Frequency analysis of ΔF/F signals
+% Rationale: Identifies dominant oscillatory frequencies and spatial distribution of low vs high–freq neurons.
 % Convert original frame index to current fps index
 for f = 1:numel(fishPaths)
 
